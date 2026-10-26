@@ -99,6 +99,30 @@ static bool is_ascii_digit(int32_t chr) {
     return chr >= '0' && chr <= '9';
 }
 
+static bool is_ascii_alpha(int32_t chr) {
+    return (chr >= 'a' && chr <= 'z') || (chr >= 'A' && chr <= 'Z');
+}
+
+static bool is_ascii_upper(int32_t chr) {
+    return chr >= 'A' && chr <= 'Z';
+}
+
+// Only numerals written with i, v and x (1 to 39) are recognized, so that
+// words built from l, c, d and m are never taken for list markers.
+static bool is_roman_digit(int32_t chr) {
+    switch (chr) {
+        case 'i':
+        case 'v':
+        case 'x':
+        case 'I':
+        case 'V':
+        case 'X':
+            return true;
+        default:
+            return false;
+    }
+}
+
 // Returns the indentation level which lines of a list item should have at
 // minimum. Should only be called with blocks for which `is_list_item` returns
 // true.
@@ -858,6 +882,93 @@ static bool parse_ordered_list_marker(Scanner *s, TSLexer *lexer,
     return false;
 }
 
+// Pandoc's fancy_lists markers: a letter or roman numeral followed by `.` or
+// `)`, or any enumerator enclosed in parentheses, as in `(a)` or `(1)`. A
+// capital letter followed by `.` needs at least two spaces after it, so that
+// initials such as `B. Russell` stay text. A fancy marker never interrupts a
+// paragraph. Sets `advanced` once the lexer has moved past the line start.
+static bool parse_fancy_list_marker(Scanner *s, TSLexer *lexer,
+                                    const bool *valid_symbols,
+                                    bool *advanced) {
+    if (s->indentation > 3 ||
+        !(valid_symbols[LIST_MARKER_PARENTHESIS] ||
+          valid_symbols[LIST_MARKER_DOT] ||
+          valid_symbols[LIST_MARKER_PARENTHESIS_DONT_INTERRUPT] ||
+          valid_symbols[LIST_MARKER_DOT_DONT_INTERRUPT])) {
+        return false;
+    }
+    *advanced = true;
+    bool enclosed = false;
+    if (lexer->lookahead == '(') {
+        advance(s, lexer);
+        enclosed = true;
+    }
+    int32_t first = lexer->lookahead;
+    size_t length = 0;
+    if (enclosed && is_ascii_digit(first)) {
+        while (is_ascii_digit(lexer->lookahead)) {
+            length++;
+            advance(s, lexer);
+        }
+    } else if (is_ascii_alpha(first)) {
+        advance(s, lexer);
+        length = 1;
+        while (is_roman_digit(first) && is_roman_digit(lexer->lookahead) &&
+               is_ascii_upper(lexer->lookahead) == is_ascii_upper(first)) {
+            length++;
+            advance(s, lexer);
+        }
+    } else {
+        return false;
+    }
+    if (length > 8) {
+        return false;
+    }
+    bool dot = false;
+    if (lexer->lookahead == '.' && !enclosed) {
+        dot = true;
+    } else if (lexer->lookahead != ')') {
+        return false;
+    }
+    advance(s, lexer);
+    uint8_t extra_indentation = 0;
+    while (lexer->lookahead == ' ' || lexer->lookahead == '\t') {
+        extra_indentation += advance(s, lexer);
+    }
+    bool line_end = lexer->lookahead == '\n' || lexer->lookahead == '\r';
+    if (dot && length == 1 && is_ascii_upper(first) &&
+        (line_end || extra_indentation < 2)) {
+        return false;
+    }
+    if (line_end) {
+        extra_indentation = 1;
+    }
+    if (extra_indentation < 1) {
+        return false;
+    }
+    bool dont_interrupt = s->matched == s->open_blocks.size;
+    TokenType marker =
+        dot ? (dont_interrupt ? LIST_MARKER_DOT_DONT_INTERRUPT : LIST_MARKER_DOT)
+            : (dont_interrupt ? LIST_MARKER_PARENTHESIS_DONT_INTERRUPT : LIST_MARKER_PARENTHESIS);
+    if (!valid_symbols[marker]) {
+        return false;
+    }
+    lexer->result_symbol = marker;
+    extra_indentation--;
+    if (extra_indentation <= 3) {
+        extra_indentation += s->indentation;
+        s->indentation = 0;
+    } else {
+        uint8_t temp = s->indentation;
+        s->indentation = extra_indentation;
+        extra_indentation = temp;
+    }
+    if (!s->simulate)
+        push_block(s, (Block)(LIST_ITEM + extra_indentation + length + enclosed));
+    mark_end(s, lexer);
+    return true;
+}
+
 static bool parse_minus(Scanner *s, TSLexer *lexer, const bool *valid_symbols) {
     if (s->indentation <= 3 &&
         (valid_symbols[LIST_MARKER_MINUS] ||
@@ -1249,14 +1360,17 @@ static bool parse_html_block(Scanner *s, TSLexer *lexer,
     return false;
 }
 
+// `at_line_start` is false when the lexer has already advanced past the start
+// of the line, which the caller marked as the end of the token.
 static bool parse_pipe_table(Scanner *s, TSLexer *lexer,
-                             const bool *valid_symbols) {
+                             const bool *valid_symbols, bool at_line_start) {
 
     // unused
     (void)(valid_symbols);
 
     // PIPE_TABLE_START is zero width
-    mark_end(s, lexer);
+    if (at_line_start)
+        mark_end(s, lexer);
     // count number of cells
     size_t cell_count = 0;
     // also remember if we see starting and ending pipes, as empty headers have
@@ -1264,7 +1378,7 @@ static bool parse_pipe_table(Scanner *s, TSLexer *lexer,
     bool starting_pipe = false;
     bool ending_pipe = false;
     bool empty = true;
-    if (lexer->lookahead == '|') {
+    if (at_line_start && lexer->lookahead == '|') {
         starting_pipe = true;
         advance(s, lexer);
     }
@@ -1507,9 +1621,16 @@ static bool scan(Scanner *s, TSLexer *lexer, const bool *valid_symbols) {
                 // A < could mark the beginning of a html block
                 return parse_html_block(s, lexer, valid_symbols);
         }
+        bool advanced = false;
+        if (lexer->lookahead == '(' || is_ascii_alpha(lexer->lookahead)) {
+            mark_end(s, lexer);
+            if (parse_fancy_list_marker(s, lexer, valid_symbols, &advanced)) {
+                return true;
+            }
+        }
         if (lexer->lookahead != '\r' && lexer->lookahead != '\n' &&
             valid_symbols[PIPE_TABLE_START]) {
-            return parse_pipe_table(s, lexer, valid_symbols);
+            return parse_pipe_table(s, lexer, valid_symbols, !advanced);
         }
     } else { // we are in the state of trying to match all currently open blocks
         bool partial_success = false;
